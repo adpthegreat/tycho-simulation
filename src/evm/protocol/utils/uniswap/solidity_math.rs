@@ -37,6 +37,27 @@ fn truncate_to_u256(value: U512) -> Result<U256, SimulationError> {
     Ok(U256::from_limbs([limbs[0], limbs[1], limbs[2], limbs[3]]))
 }
 
+//https://github.com/Uniswap/contracts/blob/6a9e6fc98241086a8ccba8135e32583e19cc9fd4/src/briefcase/protocols/lib-external/solidity-lib/contracts/libraries/Babylonian.sol#L6
+//https://github.com/Uniswap/v2-core/blob/ee547b17853e71ed4e0101ccfd52e70d5acded58/contracts/libraries/Math.sol#L11
+
+/// https://en.wikipedia.org/wiki/Methods_of_computing_square_roots#Babylonian_method
+pub fn sqrt_u256(y: U256) -> U256 {
+    if y > U256::from(3) {
+        let mut z = y;
+        let mut x = y / U256::from(2) + U256::from(1);
+        while x < z {
+            z = x;
+            x = (y / x + x) / U256::from(2);
+        }
+        z
+    } else if y != U256::from(0) {
+        U256::from(1)
+    } else {
+        U256::from(0)
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;

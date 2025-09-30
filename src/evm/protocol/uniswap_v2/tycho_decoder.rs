@@ -4,7 +4,10 @@ use tycho_client::feed::{synchronizer::ComponentWithState, BlockHeader};
 use tycho_common::{models::token::Token, Bytes};
 
 use crate::{
-    evm::protocol::{cpmm::protocol::cpmm_try_from_with_header, uniswap_v2::state::UniswapV2State},
+    evm::{
+        U256,
+        protocol::{cpmm::protocol::cpmm_try_from_with_header, uniswap_v2::state::UniswapV2State}
+    },
     protocol::{
         errors::InvalidSnapshotError,
         models::{DecoderContext, TryFromWithBlock},
@@ -23,8 +26,47 @@ impl TryFromWithBlock<ComponentWithState, BlockHeader> for UniswapV2State {
         _all_tokens: &HashMap<Bytes, Token>,
         _decoder_context: &DecoderContext,
     ) -> Result<Self, Self::Error> {
-        let (reserve0, reserve1) = cpmm_try_from_with_header(snapshot)?;
-        Ok(Self::new(reserve0, reserve1))
+    let reserve0 = U256::from_be_slice(
+        snapshot
+            .state
+            .attributes
+            .get("reserve0")
+            .ok_or(InvalidSnapshotError::MissingAttribute("reserve0".to_string()))?,
+    );
+
+    let reserve1 = U256::from_be_slice(
+        snapshot
+            .state
+            .attributes
+            .get("reserve1")
+            .ok_or(InvalidSnapshotError::MissingAttribute("reserve1".to_string()))?,
+    ); 
+
+    let balance0 = U256::from_be_slice(
+        snapshot
+            .state
+            .attributes
+            .get("balance0")
+            .ok_or(InvalidSnapshotError::MissingAttribute("balance0".to_string()))?,
+    );
+    let balance1 = U256::from_be_slice(
+        snapshot
+            .state
+            .attributes
+            .get("balance1")
+            .ok_or(InvalidSnapshotError::MissingAttribute("balance1".to_string()))?,
+    );
+    let liquidity = U256::from_be_slice(
+        snapshot
+            .state
+            .attributes
+            .get("liquidity")
+            .ok_or(InvalidSnapshotError::MissingAttribute("liquidity".to_string()))?,
+    );
+
+    let total_supply = U256::from(100000); //PLACEHOLDER, CHANGE THIS HIS TO USE ENTRYPOINT
+
+        Ok(Self::new(reserve0, reserve1, balance0, balance1, liquidity, total_supply, None))
     }
 }
 
@@ -61,6 +103,10 @@ mod tests {
                 attributes: HashMap::from([
                     ("reserve0".to_string(), Bytes::from(vec![0; 32])),
                     ("reserve1".to_string(), Bytes::from(vec![0; 32])),
+                    ("balance0".to_string(), Bytes::from(vec![0; 32])),
+                    ("balance1".to_string(), Bytes::from(vec![0; 32])),
+                    ("liquidity".to_string(), Bytes::from(vec![0; 32])),
+                    ("total_supply".to_string(), Bytes::from(vec![0; 32])),
                 ]),
                 balances: HashMap::new(),
             },
@@ -87,10 +133,18 @@ mod tests {
     #[rstest]
     #[case::missing_reserve0("reserve0")]
     #[case::missing_reserve1("reserve1")]
+    #[case::missing_reserve1("balance1")]
+    #[case::missing_reserve1("balance1")]
+    #[case::missing_reserve1("liquidity")]
+    #[case::missing_reserve1("total_supply")]
     async fn test_usv2_try_from_missing_attribute(#[case] missing_attribute: &str) {
         let mut attributes = HashMap::from([
             ("reserve0".to_string(), Bytes::from(vec![0; 32])),
             ("reserve1".to_string(), Bytes::from(vec![0; 32])),
+            ("balance0".to_string(), Bytes::from(vec![0; 32])),
+            ("balance1".to_string(), Bytes::from(vec![0; 32])),
+            ("liquidity".to_string(), Bytes::from(vec![0; 32])),
+            ("total_supply".to_string(), Bytes::from(vec![0; 32])),
         ]);
         attributes.remove(missing_attribute);
 

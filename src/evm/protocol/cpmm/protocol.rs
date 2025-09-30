@@ -12,7 +12,7 @@ use tycho_common::{
 use super::reserve_price::spot_price_from_reserves;
 use crate::{
     evm::protocol::{
-        safe_math::{safe_add_u256, safe_div_u256, safe_mul_u256},
+        safe_math::{safe_add_u256, safe_sub_u256, safe_div_u256, safe_mul_u256},
         u256_num::u256_to_biguint,
     },
     protocol::errors::InvalidSnapshotError,
@@ -35,7 +35,7 @@ pub fn cpmm_try_from_with_header(
             .attributes
             .get("reserve1")
             .ok_or(InvalidSnapshotError::MissingAttribute("reserve1".to_string()))?,
-    );
+    ); 
     Ok((reserve0, reserve1))
 }
 
@@ -124,19 +124,18 @@ pub fn cpmm_delta_transition(
     reserve0_mut: &mut U256,
     reserve1_mut: &mut U256,
 ) -> Result<(), TransitionError<String>> {
-    // reserve0 and reserve1 are considered required attributes and are expected in every delta
-    // we process
+    // reserve0 , reserve1, are considered required attributes and are expected in every delta
     let reserve0 = U256::from_be_slice(
         delta
             .updated_attributes
             .get("reserve0")
-            .ok_or(TransitionError::MissingAttribute("reserve0".to_string()))?,
+            .ok_or(TransitionError::MissingAttribute("reserve0".to_string()))?
     );
     let reserve1 = U256::from_be_slice(
         delta
             .updated_attributes
             .get("reserve1")
-            .ok_or(TransitionError::MissingAttribute("reserve1".to_string()))?,
+            .ok_or(TransitionError::MissingAttribute("reserve1".to_string()))?
     );
     *reserve0_mut = reserve0;
     *reserve1_mut = reserve1;

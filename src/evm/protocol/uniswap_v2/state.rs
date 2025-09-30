@@ -1,10 +1,13 @@
 use std::{any::Any, collections::HashMap};
-
-use alloy::primitives::U256;
+use std::str::FromStr;
+use alloy::primitives::{Address as AlloyAddress, U256};
 use num_bigint::{BigUint, ToBigUint};
 use tycho_common::{
     dto::ProtocolStateDelta,
-    models::token::Token,
+    models::{
+        token::Token,
+        Address
+    },
     simulation::{
         errors::{SimulationError, TransitionError},
         protocol_sim::{Balances, GetAmountOutResult, ProtocolSim},
@@ -16,7 +19,10 @@ use crate::evm::protocol::{
     cpmm::protocol::{
         cpmm_delta_transition, cpmm_fee, cpmm_get_amount_out, cpmm_get_limits, cpmm_spot_price,
     },
-    safe_math::{safe_add_u256, safe_sub_u256},
+    safe_math::{safe_add_u256, safe_sub_u256, safe_div_u256, safe_mul_u256},
+    utils::uniswap::{
+            solidity_math::{sqrt_u256},
+    },
     u256_num::{biguint_to_u256, u256_to_biguint},
 };
 
@@ -26,7 +32,13 @@ const UNISWAP_V2_FEE_BPS: u32 = 30; // 0.3% fee
 pub struct UniswapV2State {
     pub reserve0: U256,
     pub reserve1: U256,
-}
+    pub balance0: U256,
+    pub balance1: U256,
+    pub liquidity: U256,
+    pub total_supply: U256,
+    pub k_last: Option<U256>,
+} 
+    // total_supply_mut : &mut U256, since we are getting it via entrypoint then its not a delta transition effect
 
 impl UniswapV2State {
     /// Creates a new instance of `UniswapV2State` with the given reserves.
@@ -35,8 +47,245 @@ impl UniswapV2State {
     ///
     /// * `reserve0` - Reserve of token 0.
     /// * `reserve1` - Reserve of token 1.
-    pub fn new(reserve0: U256, reserve1: U256) -> Self {
-        UniswapV2State { reserve0, reserve1 }
+    /// * `balance0` - Balance of token 0 in the pair contract.
+    /// * `balance1` - Balance of token 1 in the pair contract
+    /// * `liquidity` - Balance of lp tokens in the pair contract.
+    /// * `total_supply` - total circulating supply of lp_tokens.
+    /// * `k_last` - last balance of 
+    pub fn new(
+            reserve0: U256, 
+            reserve1: U256, 
+            balance0: U256, 
+            balance1: U256,
+            liquidity: U256,
+            total_supply: U256,
+            k_last: Option<U256>
+        ) -> Self {
+        UniswapV2State { 
+            reserve0, 
+            reserve1,
+            balance0,
+            balance1,
+            liquidity,
+            total_supply,
+            k_last
+        } 
+    }
+
+    //the rest of the helper methods 
+    pub fn fee_to() -> Option<AlloyAddress> { //change to address
+        Some(AlloyAddress::from_str("0000000000000000000000000000000000000000").unwrap())
+    }
+
+    pub fn update(
+        &mut self,
+        balance0: U256,
+        balance1: U256,
+        reserve0: U256,
+        reserve1: U256,
+    ) -> Result<(), SimulationError> {
+        // require(balance0 <= uint112::MAX && balance1 <= uint112::MAX)
+        if balance0 > U256::from(u128::MAX) || balance1 > U256::from(u128::MAX) {
+            return Err(SimulationError::FatalError("overflow".to_string())); 
+        }
+
+        self.reserve0 = balance0;
+        self.reserve1 = balance1;
+
+        Ok(())
+    }
+
+    //https://github.com/Uniswap/v2-core/blob/ee547b17853e71ed4e0101ccfd52e70d5acded58/contracts/UniswapV2Pair.sol#L89
+    pub fn mint_fee(
+        &mut self,
+        reserve0: U256,
+        reserve1: U256,
+        fee_to: Option<Bytes>,
+    ) -> Result<bool, SimulationError> {
+        let fee_on = fee_to.is_some();
+
+        if fee_on {
+            if let Some(k_last) = self.k_last {
+                if !k_last.is_zero() {
+                    let root_k = sqrt_u256(safe_mul_u256(reserve0, reserve1)?);
+                    let root_k_last = sqrt_u256(k_last);
+
+                    if root_k > root_k_last {
+                        let numerator = safe_mul_u256(
+                            self.total_supply,
+                            safe_sub_u256(root_k, root_k_last)?,
+                        )?;
+                        let denominator = safe_add_u256(
+                            safe_mul_u256(root_k, U256::from(5))?,
+                            root_k_last,
+                        )?;
+                        let liquidity = safe_div_u256(numerator, denominator)?;
+
+                        if liquidity > U256::ZERO {
+                            self.mint(fee_to);
+                        }
+                    }
+                }
+            }
+        } else if let Some(k_last) = self.k_last {
+            if !k_last.is_zero() {
+                self.k_last = Some(U256::ZERO);
+            }
+        }
+
+        Ok(fee_on)
+    }
+
+    pub fn mint(
+        &mut self,
+        fee_to: Option<Bytes>,
+    ) -> Result<U256, SimulationError> {
+        let MINIMUM_LIQUIDITY = U256::from(1000);
+        let reserve0 = self.reserve0;
+        let reserve1 = self.reserve1;
+
+        let balance0 = self.balance0;
+        let balance1 = self.balance1;
+
+        let amount0 = safe_sub_u256(balance0, reserve0)?;
+        let amount1 = safe_sub_u256(balance1, reserve1)?;
+
+        let fee_on = self.mint_fee(reserve0, reserve1, fee_to)?;
+
+        let mut liquidity: U256;
+        if self.total_supply.is_zero() {
+            let prod = safe_mul_u256(amount0, amount1)?;
+            liquidity = sqrt_u256(prod);
+            liquidity = safe_sub_u256(liquidity, MINIMUM_LIQUIDITY)?;
+            // lock minimum liquidity
+            self.total_supply = safe_add_u256(self.total_supply, MINIMUM_LIQUIDITY)?;
+        } else {
+            let l0 = safe_div_u256(safe_mul_u256(amount0, self.total_supply)?, reserve0)?;
+            let l1 = safe_div_u256(safe_mul_u256(amount1, self.total_supply)?, reserve1)?;
+            liquidity = std::cmp::min(l0, l1);
+        }
+
+        if liquidity.is_zero() {
+            return Err(SimulationError::FatalError("Insufficient liquidity minted".to_string())); 
+        }
+
+        // mint LP tokens
+        let mut bal = self.liquidity; // this line 
+
+        bal = safe_add_u256(bal, liquidity)?;
+        self.total_supply = safe_add_u256(self.total_supply, liquidity)?;
+
+        self.update(balance0, balance1, reserve0, reserve1)?; 
+        if fee_on {
+            self.k_last = Some(safe_mul_u256(self.reserve0, self.reserve1)?);
+        }
+
+        Ok(liquidity)
+    }
+
+    pub fn burn(
+        &mut self,
+        fee_to: Option<Bytes>, 
+    ) -> Result<(U256, U256), SimulationError> {
+        let reserve0 = self.reserve0;
+        let reserve1 = self.reserve1;
+
+        let balance0 = self.balance0;
+        let balance1 = self.balance1;
+
+        let liquidity = self.liquidity;
+
+        let fee_on = self.mint_fee(reserve0, reserve1, fee_to)?;
+
+        let amount0 = safe_div_u256(safe_mul_u256(liquidity, balance0)?, self.total_supply)?;
+        let amount1 = safe_div_u256(safe_mul_u256(liquidity, balance1)?, self.total_supply)?;
+
+        if amount0.is_zero() || amount1.is_zero() {
+            return Err(SimulationError::FatalError("Insufficient liquidity burned".to_string())); 
+        }
+
+        // burn LP tokens
+        self.liquidity = safe_sub_u256(liquidity, liquidity)?; //THIS
+        self.total_supply = safe_sub_u256(self.total_supply, liquidity)?;
+
+        // send tokens (state change only)
+        self.balance0 = safe_sub_u256(balance0, amount0)?;
+
+        self.balance1 = safe_sub_u256(balance1, amount1)?;
+
+        let balance0 = self.balance0;
+        let balance1 = self.balance1;
+
+        self.update(balance0, balance1, reserve0, reserve1)?; // we don't need block timestamp so it was removed 
+        if fee_on {
+            self.k_last = Some(safe_mul_u256(self.reserve0, self.reserve1)?);
+        }
+
+        Ok((amount0, amount1))
+    }
+
+    //FROM: https://github.com/Uniswap/v2-periphery/blob/master/contracts/libraries/UniswapV2LiquidityMathLibrary.sol#L75
+    /// Computes liquidity value given all the parameters of the pair
+    pub fn compute_liquidity_value(
+        &self,
+        liquidity_amount: U256,
+        fee_on: bool,
+        k_last: Option<U256>, // we need to index k_last now lol, and fee_on 
+    ) -> Result<(U256, U256), SimulationError> {
+        let reserve0: U256 = self.reserve0;
+        let reserve1: U256 = self.reserve1;
+        let mut total_supply: U256 = self.total_supply;
+
+        if let Some(k_last_val) = k_last {
+            if fee_on && k_last_val > U256::ZERO {
+                let root_k = sqrt_u256(safe_mul_u256(reserve0, reserve1)?);
+                let root_k_last = sqrt_u256(k_last_val);
+
+                if root_k > root_k_last {
+                    let numerator1 = total_supply;
+                    let numerator2 = safe_sub_u256(root_k, root_k_last)?;
+                    let denominator = safe_add_u256(
+                        safe_mul_u256(root_k, U256::from(5))?,
+                        root_k_last,
+                    )?;
+
+                    let fee_liquidity = safe_div_u256(
+                        safe_mul_u256(numerator1, numerator2)?,
+                        denominator,
+                    )?;
+
+                    total_supply = safe_add_u256(total_supply, fee_liquidity)?;
+                }
+            }
+        }
+
+
+        let token_a_amount =
+            safe_div_u256(safe_mul_u256(reserve0, liquidity_amount)?, total_supply)?;
+        let token_b_amount =
+            safe_div_u256(safe_mul_u256(reserve1, liquidity_amount)?, total_supply)?;
+
+        Ok((token_a_amount, token_b_amount))
+    }
+
+    /// Gets all current parameters from the pair and computes value of a liquidity amount
+    /// ⚠️ Note: subject to manipulation (e.g., sandwich attacks).
+    pub fn get_liquidity_value(
+        &mut self,
+        liquidity_amount: U256,
+    ) -> Result<(U256, U256), SimulationError> {
+        let fee_on = Self::fee_to().is_some();
+
+        let k_last = if fee_on { self.k_last } else { Some(U256::ZERO) };
+
+        let total_supply = self.total_supply;
+
+        Self::compute_liquidity_value(
+            self,
+            liquidity_amount,
+            fee_on,
+            k_last,
+        )
     }
 }
 
@@ -49,7 +298,7 @@ impl ProtocolSim for UniswapV2State {
         cpmm_spot_price(base, quote, self.reserve0, self.reserve1)
     }
 
-    fn get_amount_out(
+    fn get_amount_out( //modify this 
         &self,
         amount_in: BigUint,
         token_in: &Token,
@@ -96,8 +345,48 @@ impl ProtocolSim for UniswapV2State {
         _tokens: &HashMap<Bytes, Token>,
         _balances: &Balances,
     ) -> Result<(), TransitionError<String>> {
-        let (reserve0_mut, reserve1_mut) = (&mut self.reserve0, &mut self.reserve1);
-        cpmm_delta_transition(delta, reserve0_mut, reserve1_mut)
+        // reserve0 , reserve1, balance0, balance1, liquidity, total_supply are considered required attributes and are expected in every delta
+        // we process
+        let reserve0 = U256::from_be_slice(
+            delta
+            .updated_attributes
+            .get("reserve0")
+            .ok_or(TransitionError::MissingAttribute("reserve0".to_string()))?
+         );
+        let reserve1 = U256::from_be_slice(
+            delta
+                .updated_attributes
+                .get("reserve1")
+                .ok_or(TransitionError::MissingAttribute("reserve1".to_string()))?
+        );
+        let balance0 = U256::from_be_slice(
+            delta
+                .updated_attributes
+                .get("balance0")
+                .ok_or(TransitionError::MissingAttribute("reserve1".to_string()))?
+        );
+        let balance1 = U256::from_be_slice(
+            delta
+                .updated_attributes
+                .get("balance1")
+                .ok_or(TransitionError::MissingAttribute("reserve1".to_string()))?
+        );
+        let liquidity = U256::from_be_slice(
+            delta
+                .updated_attributes
+                .get("liquidity")
+                .ok_or(TransitionError::MissingAttribute("liquidity".to_string()))?
+        );
+
+        let total_supply = U256::from(10000); //PLACEHOLDER, CHANGE THIS TO USE ENTRYPOINT
+                
+        self.reserve0 = reserve0;
+        self.reserve1 = reserve1;
+        self.balance0 = balance0;
+        self.balance1 = balance1;
+        self.liquidity = liquidity;
+        self.total_supply = total_supply;
+        Ok(())
     }
 
     fn clone_box(&self) -> Box<dyn ProtocolSim> {
@@ -114,7 +403,7 @@ impl ProtocolSim for UniswapV2State {
 
     fn eq(&self, other: &dyn ProtocolSim) -> bool {
         if let Some(other_state) = other.as_any().downcast_ref::<Self>() {
-            let (self_reserve0, self_reserve1) = (self.reserve0, self.reserve1);
+            let (self_reserve0, self_reserve1) = (self.reserve0, self.reserve1); // modify for total supply 
             let (other_reserve0, other_reserve1) = (other_state.reserve0, other_state.reserve1);
             self_reserve0 == other_reserve0 &&
                 self_reserve1 == other_reserve1 &&
@@ -295,7 +584,7 @@ mod tests {
     #[test]
     fn test_delta_transition() {
         let mut state =
-            UniswapV2State::new(U256::from_str("1000").unwrap(), U256::from_str("1000").unwrap());
+            UniswapV2State::new(U256::from_str("1000").unwrap(), U256::from_str("1000").unwrap());//CHANGE THIS 
         let attributes: HashMap<String, Bytes> = vec![
             ("reserve0".to_string(), Bytes::from(1500_u64.to_be_bytes().to_vec())),
             ("reserve1".to_string(), Bytes::from(2000_u64.to_be_bytes().to_vec())),
