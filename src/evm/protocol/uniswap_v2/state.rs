@@ -401,13 +401,16 @@ impl ProtocolSim for UniswapV2State {
         self
     }
 
-    fn eq(&self, other: &dyn ProtocolSim) -> bool {
+   fn eq(&self, other: &dyn ProtocolSim) -> bool {
         if let Some(other_state) = other.as_any().downcast_ref::<Self>() {
-            let (self_reserve0, self_reserve1) = (self.reserve0, self.reserve1); // modify for total supply 
-            let (other_reserve0, other_reserve1) = (other_state.reserve0, other_state.reserve1);
-            self_reserve0 == other_reserve0 &&
-                self_reserve1 == other_reserve1 &&
-                self.fee() == other_state.fee()
+            self.reserve0 == other_state.reserve0 &&
+            self.reserve1 == other_state.reserve1 &&
+            self.balance0 == other_state.balance0 &&
+            self.balance1 == other_state.balance1 &&
+            self.liquidity == other_state.liquidity &&
+            self.total_supply == other_state.total_supply &&
+            self.k_last == other_state.k_last &&
+            self.fee() == other_state.fee()
         } else {
             false
         }
